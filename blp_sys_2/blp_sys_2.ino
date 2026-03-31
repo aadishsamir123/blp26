@@ -3,7 +3,7 @@
 #include <SPI.h>
 #include <math.h>
 
-// pins — keep these wired as-is
+// --- Pin Definitions ---
 #define RAIN_PIN      A0
 #define SOIL_PIN      A1
 #define GREEN_LED     8
@@ -12,261 +12,199 @@
 #define TFT_DC        7
 #define TFT_RST       6
 
-// sensor thresholds — tune to your sensors if readings feel off
+// --- Thresholds ---
 #define RAIN_THRESHOLD  100
 #define SOIL_DRY        600
 #define SOIL_WET        300
 
-// the screen is exactly this big, don't ask why 128 and 160
+// ST7735 are 128x160
 #define SCREEN_W 128
 #define SCREEN_H 160
 
-// all RGB565, hand-picked for contrast on actual hardware (looks different than simulator)
-#define D_BG          0x0841   // near-black with a hint of blue, not pure black (banding)
-#define D_CARD        0x10A2   // slightly lifted surface, readable against bg
-#define D_HEADER      0x0526   // deep teal-navy for the top bar
-#define D_ACCENT      0x07FF   // cyan — the one "alive" color
-#define D_SUBTEXT     0x7BEF   // mid-grey, for labels that shouldn't fight the data
-#define D_BORDER      0x2965   // subtle edge, just enough to see the card boundary
-#define D_DIVIDER     0x18C3   // horizontal rule color, darker than border
+// --- Dark mode colors ---
+#define D_BG          0x0841
+#define D_CARD        0x1082
+#define D_HEADER      0x0438
+#define D_ACCENT      0x04FF
+#define D_SUBTEXT     0x8410
+#define D_BORDER      0x2945
 
-// these never change — color IS the meaning
-#define S_DRY         0xFC40   // amber-orange: needs attention
-#define S_WET         0x035F   // deep blue: saturated soil
-#define S_OPTIMAL     0x07E0   // pure green: all good
-#define S_RAIN        0x4C9F   // blue-violet: active rain
-#define S_CLEAR       0xFE60   // warm yellow: sunny clear
+// --- Light mode colors ---
+#define L_BG          0xEF7D
+#define L_CARD        0xFFFF
+#define L_HEADER      0x2C9F
+#define L_ACCENT      0x035F
+#define L_SUBTEXT     0x6B4D
+#define L_BORDER      0xC618
 
-// icon dot radius — 3px feels right at 128px wide
-#define DOT_R 3
+// --- Status colors ---
+#define COLOR_GREEN     0x07E0
+#define COLOR_BLUE      0x035F
+#define COLOR_ORANGE    0xFC60
+#define COLOR_YELLOW    0xFFE0
 
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
 
-// track previous state so we only redraw what changed
 int  prevSoilValue = -1;
 bool prevRaining   = false;
 bool firstDraw     = true;
+bool lightMode     = false;
 
-
-
-// fills a card with a 1px border on all sides
-void drawCard(int x, int y, int w, int h, uint16_t fill) {
-  tft.fillRect(x, y, w, h, fill);
-  tft.drawRect(x, y, w, h, D_BORDER);
+uint16_t C(uint16_t dark, uint16_t light) {
+  return lightMode ? light : dark;
 }
 
-// thin horizontal rule — use between sections inside a card
-void drawDivider(int x, int y, int w) {
-  tft.drawFastHLine(x, y, w, D_DIVIDER);
+// --- Draw rounded card ---
+void drawCard(int x, int y, int w, int h, uint16_t color) {
+  tft.fillRect(x + 2, y,     w - 4, h,     color);
+  tft.fillRect(x,     y + 2, w,     h - 4, color);
+  tft.drawRect(x + 1, y + 1, w - 2, h - 2, C(D_BORDER, L_BORDER));
 }
 
-// segmented moisture bar — gaps every 10px so it reads like a discrete scale, not a blob
-// outer frame uses accent to anchor it visually
-void drawMoistureBar(int x, int y, int w, int h, float pct, uint16_t fillColor) {
-  // clear zone first — prevents ghost pixels from previous value
-  tft.fillRect(x - 1, y - 1, w + 2, h + 2, D_CARD);
-
-  // background track
-  tft.fillRect(x, y, w, h, D_BG);
-
-  // filled portion, gap every 10px for segmented look
-  int filled = (int)(pct * (float)w);
+// --- Draw segmented moisture bar ---
+void drawBar(int x, int y, int w, int h, float pct, uint16_t fillColor) {
+  tft.fillRect(x, y, w, h, C(D_BORDER, L_BORDER));
+  int filled = (int)(pct * w);
   for (int i = 0; i < filled; i++) {
-    if ((i % 10) != 9) tft.drawFastVLine(x + i, y + 1, h - 2, fillColor);
+    if (i % 10 != 9) tft.drawFastVLine(x + i, y + 1, h - 2, fillColor);
   }
-
-  // outer frame using accent — makes the bar feel contained
-  tft.drawRect(x - 1, y - 1, w + 2, h + 2, D_ACCENT);
+  tft.drawRect(x - 1, y - 1, w + 2, h + 2, C(D_ACCENT, L_ACCENT));
 }
 
-// 4-drop rain icon, horizontally centered at cx
-void drawRainIcon(int cx, int y, uint16_t color) {
-  int offsets[] = {-21, -7, 7, 21};
-  for (int i = 0; i < 4; i++) {
-    int dx = cx + offsets[i];
-    int dy = y + 5;
-    tft.fillCircle(dx, dy + 4, DOT_R - 1, color);
-    tft.drawLine(dx - 1, dy, dx, dy + 2, color);
-    tft.drawLine(dx + 1, dy, dx, dy + 2, color);
-  }
+// --- Draw raindrop ---
+void drawRaindrop(int x, int y, uint16_t color) {
+  tft.fillCircle(x, y + 3, 2, color);
+  tft.drawLine(x, y, x - 1, y + 2, color);
+  tft.drawLine(x, y, x + 1, y + 2, color);
 }
 
-// sun: filled circle core + 8 ray lines
-// ray length fixed at 4px — any longer and it clips on tight layouts
-void drawSunIcon(int cx, int cy, uint16_t color) {
-  tft.fillCircle(cx, cy, 4, color);
-  for (int i = 0; i < 8; i++) {
-    float a = i * 3.14159f / 4.0f;
-    int x1 = cx + (int)(6  * cosf(a));
-    int y1 = cy + (int)(6  * sinf(a));
-    int x2 = cx + (int)(10 * cosf(a));
-    int y2 = cy + (int)(10 * sinf(a));
+// --- Draw sun ---
+void drawSun(int cx, int cy, uint16_t color) {
+  tft.fillCircle(cx, cy, 5, color);
+  for (int a = 0; a < 8; a++) {
+    float angle = a * 3.14159f / 4.0f;
+    int x1 = cx + (int)(7  * cos(angle));
+    int y1 = cy + (int)(7  * sin(angle));
+    int x2 = cx + (int)(11 * cos(angle));
+    int y2 = cy + (int)(11 * sin(angle));
     tft.drawLine(x1, y1, x2, y2, color);
   }
 }
 
-
-// maps raw soil ADC to a human label + status color
-// raw: 0 = fully wet, 1023 = bone dry (most capacitive sensors work this way)
+// --- Soil label + color ---
 void getSoilStatus(int val, char* label, uint16_t &color) {
   if (val > SOIL_DRY) {
     strcpy(label, "DRY");
-    color = S_DRY;
+    color = COLOR_ORANGE;
   } else if (val < SOIL_WET) {
-    strcpy(label, "SATURATED");
-    color = S_WET;
+    strcpy(label, "VERY WET");
+    color = COLOR_BLUE;
   } else {
     strcpy(label, "OPTIMAL");
-    color = S_OPTIMAL;
+    color = COLOR_GREEN;
   }
 }
 
-
-
-// draws everything that doesn't change between readings
-// call once on boot, then only redraw dynamic regions in updateDisplay()
+// --- Draw static shell ---
 void drawShell() {
-  tft.fillScreen(D_BG);
+  tft.fillScreen(C(D_BG, L_BG));
 
-  // ── header bar ──
-  // 24px tall — just enough for 1x text with 6px padding top and bottom
-  tft.fillRect(0, 0, SCREEN_W, 24, D_HEADER);
-
-  // accent stripe under header — 2px is all it takes to feel intentional
-  tft.fillRect(0, 22, SCREEN_W, 2, D_ACCENT);
-
-  // header label, vertically centered in the 24px bar
+  // Header
+  tft.fillRect(0, 0, SCREEN_W, 22, C(D_HEADER, L_HEADER));
+  tft.fillRect(0, 19, SCREEN_W, 3, C(D_ACCENT, L_ACCENT));
   tft.setTextSize(1);
   tft.setTextColor(0xFFFF);
-  tft.setCursor(8, 8);
+  tft.setCursor(10, 8);
   tft.print("GARDEN MONITOR");
 
-  // live indicator dot — top right, pulses in updateDisplay() each cycle
-  tft.drawCircle(116, 12, 3, D_ACCENT);
-
-  // ── soil card ──
-  // starts at y=28 (24px header + 2px accent + 2px gap)
-  // 66px tall — fits status text (16px), bar (10px), labels (8px) with breathing room
-  drawCard(4, 28, 120, 66, D_CARD);
-
+  // Soil card
+  drawCard(4, 26, 120, 62, C(D_CARD, L_CARD));
   tft.setTextSize(1);
-  tft.setTextColor(D_ACCENT);
-  tft.setCursor(8, 33);
-  tft.print("SOIL MOISTURE");
+  tft.setTextColor(C(D_ACCENT, L_ACCENT));
+  tft.setCursor(10, 31);
+  tft.print("SOIL");
 
-  // faint divider under the section header
-  drawDivider(8, 43, 112);
-
-  // ── rain card ──
-  // starts at y=100 — 6px gap between cards
-  drawCard(4, 100, 120, 56, D_CARD);
-
-  tft.setTextColor(D_ACCENT);
-  tft.setCursor(8, 105);
+  // Rain card
+  drawCard(4, 94, 120, 62, C(D_CARD, L_CARD));
+  tft.setCursor(10, 99);
   tft.print("RAIN STATUS");
 
-  drawDivider(8, 115, 112);
-
-  // ── footer ──
-  // just two pixels at the very bottom — holds the screen closed
-  tft.fillRect(0, 158, SCREEN_W, 2, D_ACCENT);
+  // Footer
+  tft.fillRect(0, 157, SCREEN_W, 3, C(D_ACCENT, L_ACCENT));
 }
 
-
-
-// called every loop — only repaints regions where data actually changed
-// prevents the screen from flickering on every tick
 void updateDisplay(int soilValue, bool raining) {
 
-  // ── live indicator pulse ──
-  // toggles the dot between filled and empty each call
-  // at 1s loop delay this gives a slow heartbeat-like blink
-  static bool dotFilled = false;
-  dotFilled = !dotFilled;
-  if (dotFilled) {
-    tft.fillCircle(116, 12, 3, D_ACCENT);
-  } else {
-    tft.fillCircle(116, 12, 3, D_HEADER);
-    tft.drawCircle(116, 12, 3, D_ACCENT);
-  }
-
+  // ── SOIL CARD ──
   if (soilValue != prevSoilValue || firstDraw) {
-    char label[12];
+    char label[10];
     uint16_t statusColor;
     getSoilStatus(soilValue, label, statusColor);
 
-    // clear the dynamic zone inside the card — leave 1px border intact
-    tft.fillRect(5, 44, 118, 48, D_CARD);
+    tft.fillRect(6, 40, 116, 44, C(D_CARD, L_CARD));
 
-    // large status label — primary thing you read at a glance (2x = 12px tall chars)
+    // Big status label
     tft.setTextSize(2);
     tft.setTextColor(statusColor);
-    tft.setCursor(8, 47);
+    tft.setCursor(10, 42);
     tft.print(label);
 
-    // moisture percentage — top right of the zone
-    // converts raw ADC: 0=wet→100%, 1023=dry→0%
-    int pct = (int)((1.0f - (float)soilValue / 1023.0f) * 100.0f);
+    // Pct top right
+    int pctVal = (int)((1.0f - soilValue / 1023.0f) * 100);
     tft.setTextSize(1);
-    tft.setTextColor(D_SUBTEXT);
-
-    // right-align: 3 digits max ("100") + "%" = 4 glyphs × 6px = 24px
-    int pctX = (pct == 100) ? 98 : (pct >= 10 ? 104 : 110);
-    tft.setCursor(pctX, 47);
-    tft.print(pct);
+    tft.setTextColor(C(D_SUBTEXT, L_SUBTEXT));
+    tft.setCursor(92, 42);
+    tft.print(pctVal);
     tft.print("%");
 
-    // moisture bar — 10px tall, spans almost full card width
-    float pctF = 1.0f - ((float)soilValue / 1023.0f);
-    drawMoistureBar(8, 63, 112, 10, pctF, statusColor);
+    // Segmented bar
+    float pct = 1.0f - (soilValue / 1023.0f);
+    drawBar(10, 60, 108, 8, pct, statusColor);
 
-    // wet / dry end labels under the bar
+    // Wet/Dry labels under bar
     tft.setTextSize(1);
-    tft.setTextColor(D_SUBTEXT);
-    tft.setCursor(8, 76);
+    tft.setTextColor(C(D_SUBTEXT, L_SUBTEXT));
+    tft.setCursor(10, 71);
     tft.print("WET");
-    tft.setCursor(104, 76);
+    tft.setCursor(100, 71);
     tft.print("DRY");
 
-    // raw ADC value — tiny, in the header row after section title
-    // clear first to avoid digit-ghosts (e.g. "1023" → "200" leaves a stray "3")
-    tft.fillRect(75, 32, 48, 9, D_CARD);
-    tft.setTextColor(D_SUBTEXT);
-    tft.setCursor(77, 33);
-    tft.print("adc:");
+    // Raw value
+    tft.fillRect(54, 29, 46, 9, C(D_CARD, L_CARD));
+    tft.setCursor(56, 30);
+    tft.setTextColor(C(D_SUBTEXT, L_SUBTEXT));
+    tft.print("raw:");
     tft.print(soilValue);
   }
 
+  // ── RAIN CARD ──
   if (raining != prevRaining || firstDraw) {
-    tft.fillRect(5, 116, 118, 38, D_CARD);
+    tft.fillRect(6, 108, 116, 46, C(D_CARD, L_CARD));
 
     if (raining) {
       tft.setTextSize(2);
-      tft.setTextColor(S_RAIN);
-      tft.setCursor(8, 119);
-      tft.print("RAINING");
+      tft.setTextColor(COLOR_BLUE);
+      tft.setCursor(10, 112);
+      tft.print("RAINING!");
 
-      // 4 drops centered in the right half of the card
-      drawRainIcon(88, 119, S_RAIN);
-
-      tft.setTextSize(1);
-      tft.setTextColor(D_SUBTEXT);
-      tft.setCursor(8, 138);
-      tft.print("sensor active");
+      // Three raindrops
+      drawRaindrop(24, 132, COLOR_BLUE);
+      drawRaindrop(56, 132, COLOR_BLUE);
+      drawRaindrop(88, 132, COLOR_BLUE);
 
     } else {
       tft.setTextSize(2);
-      tft.setTextColor(S_CLEAR);
-      tft.setCursor(8, 119);
+      tft.setTextColor(lightMode ? 0xFCC0 : COLOR_YELLOW);
+      tft.setCursor(10, 112);
       tft.print("NO RAIN");
 
-      // sun icon on the right — cy=136 puts center 17px below text baseline
-      drawSunIcon(104, 136, S_CLEAR);
+      // Sun
+      drawSun(104, 136, lightMode ? 0xFCC0 : COLOR_YELLOW);
 
       tft.setTextSize(1);
-      tft.setTextColor(D_SUBTEXT);
-      tft.setCursor(8, 138);
-      tft.print("clear skies");
+      tft.setTextColor(C(D_SUBTEXT, L_SUBTEXT));
+      tft.setCursor(10, 134);
+      tft.print("Clear skies");
     }
   }
 
@@ -275,14 +213,12 @@ void updateDisplay(int soilValue, bool raining) {
   firstDraw     = false;
 }
 
-
-
 void setup() {
   Serial.begin(9600);
   pinMode(GREEN_LED, OUTPUT);
   pinMode(RED_LED, OUTPUT);
 
-  // hardware reset before init — skipping this causes ghost init on some boards
+  // Force hardware reset before init
   pinMode(TFT_RST, OUTPUT);
   digitalWrite(TFT_RST, HIGH);
   delay(10);
@@ -293,59 +229,44 @@ void setup() {
 
   tft.initR(INITR_BLACKTAB);
   tft.setRotation(0);
-  tft.fillScreen(D_BG);
+  tft.fillScreen(C(D_BG, L_BG));
 
-  // show something while sensors stabilize — first few ADC reads can be garbage
-
-  // header same as main UI so transition feels seamless
-  tft.fillRect(0, 0, SCREEN_W, 24, D_HEADER);
-  tft.fillRect(0, 22, SCREEN_W, 2, D_ACCENT);
+  // Loading screen
+  tft.fillRect(0, 0, SCREEN_W, 22, C(D_HEADER, L_HEADER));
+  tft.fillRect(0, 19, SCREEN_W, 3, C(D_ACCENT, L_ACCENT));
   tft.setTextSize(1);
   tft.setTextColor(0xFFFF);
-  tft.setCursor(8, 8);
+  tft.setCursor(10, 8);
   tft.print("GARDEN MONITOR");
 
-  // big centered boot label
   tft.setTextSize(2);
-  tft.setTextColor(D_ACCENT);
-  tft.setCursor(20, 75);
-  tft.print("STARTING");
+  tft.setTextColor(C(D_ACCENT, L_ACCENT));
+  tft.setCursor(22, 85);
+  tft.print("LOADING");
 
-  tft.setTextSize(1);
-  tft.setTextColor(D_SUBTEXT);
-  tft.setCursor(30, 105);
-  tft.print("initializing sensors");
-
-  // three dots animate left-to-right — gives a sense of progress
-  // each dot takes 350ms, total ~1.05s, long enough to feel deliberate
+  // Animated dots
   for (int d = 0; d < 3; d++) {
-    tft.fillCircle(50 + d * 14, 120, DOT_R, D_ACCENT);
-    delay(350);
+    tft.fillCircle(44 + d * 16, 110, 3, C(D_ACCENT, L_ACCENT));
+    delay(400);
   }
-
-  // short pause so user can see all three dots before it clears
-  delay(400);
+  delay(300);
 
   drawShell();
 }
 
-
-
 void loop() {
-  int rainValue = analogRead(RAIN_PIN);   // 0 = soaked, 1023 = totally dry
-  int soilValue = analogRead(SOIL_PIN);   // 0 = saturated, 1023 = bone dry
+  int rainValue = analogRead(RAIN_PIN);  // 0 is soaked, 1023 is dry
+  int soilValue = analogRead(SOIL_PIN);  // 0 is wet, 1023 is dry
 
-  Serial.print("Rain: ");  Serial.print(rainValue);
+  Serial.print("Rain: "); Serial.print(rainValue);
   Serial.print(" | Soil: "); Serial.println(soilValue);
 
-  // rain sensor reads LOW when wet — below threshold means raining
-  bool raining = (rainValue < RAIN_THRESHOLD);
+  bool raining = rainValue > RAIN_THRESHOLD;
 
-  // green LED on when soil is too dry — visual alarm without looking at screen
+  // --- Green LED lights when soil is dry ---
   digitalWrite(GREEN_LED, (soilValue > SOIL_DRY) ? HIGH : LOW);
 
-  // red LED flashes during rain
-  // the 200ms on/off blink stays within the 1s loop since updateDisplay has no delays
+  // --- Red LED is flashing when it raining ---
   if (raining) {
     digitalWrite(RED_LED, HIGH);
     delay(200);
@@ -357,6 +278,5 @@ void loop() {
 
   updateDisplay(soilValue, raining);
 
-  // 1s refresh — slow enough to avoid flicker, fast enough to catch rain onset
-  delay(1000);
+  delay(1000); // refresh every a second
 }
